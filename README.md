@@ -1,2 +1,3 @@
-# mr-panel2
-Independent copy of mr-panel
+# mr-panel
+
+MR ROBOT Panel — cloned from ready-code
