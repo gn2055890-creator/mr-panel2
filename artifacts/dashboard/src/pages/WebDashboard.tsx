@@ -2601,6 +2601,69 @@ function SettingsPage({ appId, isDark, onToggleDark, devices, onLogout, msgCount
     setTimeout(() => { setPingAllState("idle"); setPingAllDone(0); }, 4000);
   }
 
+  /* ── Send this app's updated backend URL to its registered devices ── */
+  const BACKEND_URL = `${window.location.origin}/api`;
+  const [sendUrlState, setSendUrlState] = useState<"idle" | "running" | "done" | "err">("idle");
+  const [sendUrlDone, setSendUrlDone] = useState(0);
+  const [sendUrlResult, setSendUrlResult] = useState<{ ok: number; fail: number } | null>(null);
+  const [sendUrlError, setSendUrlError] = useState("");
+
+  async function handleSendBackendUrl() {
+    if (sendUrlState === "running" || devices.length === 0) return;
+    setSendUrlState("running");
+    setSendUrlDone(0);
+    setSendUrlResult(null);
+    setSendUrlError("");
+    const BATCH = 20;
+    let offset = 0;
+    let totalOk = 0;
+    let totalFail = 0;
+    let total = 0;
+    try {
+      while (true) {
+        const recoveryHeaders = new Headers({ "Content-Type": "application/json" });
+        const legacySession = localStorage.getItem(SESS_KEY);
+        if (legacySession) recoveryHeaders.set("x-session-token", legacySession);
+        const r = await apiFetch("/api/recovery", {
+          method: "POST",
+          headers: recoveryHeaders,
+          body: JSON.stringify({ offset, limit: BATCH }),
+          signal: AbortSignal.timeout(45_000),
+        });
+        if (!r.ok) {
+          const problem = await r.json().catch(() => ({})) as { error?: string };
+          throw new Error(typeof problem.error === "string" ? problem.error : `Recovery request failed (HTTP ${r.status}).`);
+        }
+        const result = await r.json() as {
+          ok: number;
+          fail: number;
+          processed: number;
+          total: number;
+          done: boolean;
+          errors?: Array<{ code: string; error: string; count: number }>;
+        };
+        if (!Number.isFinite(result.processed) || !Number.isFinite(result.total)) throw new Error("Invalid recovery response.");
+        if (result.errors?.length) setSendUrlError(result.errors.map(error => `${error.code}: ${error.error}`).join(" "));
+        totalOk += result.ok ?? 0;
+        totalFail += result.fail ?? 0;
+        total = result.total ?? total;
+        const processed = result.processed ?? offset + BATCH;
+        setSendUrlDone(processed);
+        setSendUrlResult({ ok: totalOk, fail: totalFail });
+        if (result.done || processed >= result.total) break;
+        if (processed <= offset) throw new Error("Recovery stopped making progress. Please try again.");
+        offset = processed;
+      }
+      setSendUrlResult({ ok: totalOk, fail: totalFail });
+      setSendUrlState("done");
+      setTimeout(() => { setSendUrlState("idle"); setSendUrlDone(0); setSendUrlResult(null); }, 6000);
+    } catch (error) {
+      setSendUrlError(error instanceof Error ? error.message : "Recovery request failed.");
+      setSendUrlResult({ ok: totalOk, fail: totalFail });
+      setSendUrlState("err");
+    }
+  }
+
   const IS: React.CSSProperties = {
     width: "100%", boxSizing: "border-box", padding: "10px 12px",
     borderRadius: 8, border: `1.5px solid ${numState === "err" ? "#ef4444" : t.cardB}`,
@@ -2610,6 +2673,45 @@ function SettingsPage({ appId, isDark, onToggleDark, devices, onLogout, msgCount
 
   return (
     <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+
+      {/* ── Data Recovery ── */}
+      <div style={{ background: t.card, borderRadius: 10, border: `1px solid ${t.cardB}`, overflow: "hidden" }}>
+        <div style={{ padding: "10px 14px", borderBottom: `1px solid ${t.hdrB}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: t.txt }}>Data Recovery</span>
+          <span style={{ background: devices.length > 0 ? t.accent : t.hdrB, color: devices.length > 0 ? "#fff" : t.muted, borderRadius: 99, padding: "1px 8px", fontSize: 10, fontWeight: 800 }}>
+            {devices.length} device{devices.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+        <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 12, color: t.muted, lineHeight: 1.55 }}>
+            Sends the updated API configuration to this app's registered devices. FCM acceptance is not proof that a device applied it.
+            <div style={{ marginTop: 4, overflowWrap: "anywhere" }}>Target: {BACKEND_URL}</div>
+          </div>
+          {sendUrlState === "running" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <div style={{ height: 4, borderRadius: 99, background: t.hdrB, overflow: "hidden" }}>
+                <div style={{ height: "100%", borderRadius: 99, background: t.accent, width: `${devices.length ? Math.round((sendUrlDone / devices.length) * 100) : 0}%`, transition: "width 0.3s" }} />
+              </div>
+              <div style={{ fontSize: 11, color: t.muted, textAlign: "center" }}>Recovering {sendUrlDone} / {devices.length}…</div>
+            </div>
+          )}
+          {sendUrlState === "done" && sendUrlResult && (
+            <div style={{ fontSize: 12, textAlign: "center", fontWeight: 700, color: sendUrlResult.fail === 0 ? "#22c55e" : "#f59e0b" }}>
+              {sendUrlResult.ok === 0 && sendUrlResult.fail === 0
+                ? "No registered FCM targets found."
+                : `FCM accepted: ${sendUrlResult.ok} · Failed: ${sendUrlResult.fail}. Device confirmation pending.`}
+            </div>
+          )}
+          {sendUrlError && <div role="alert" style={{ fontSize: 12, color: "#ef4444", lineHeight: 1.5 }}>{sendUrlError}</div>}
+          <button
+            onClick={() => void handleSendBackendUrl()}
+            disabled={sendUrlState === "running" || devices.length === 0}
+            style={{ padding: "11px 0", borderRadius: 9, border: "none", background: sendUrlState === "running" ? t.hdrB : t.accent, color: sendUrlState === "running" ? t.muted : "#fff", fontWeight: 700, fontSize: 13, cursor: sendUrlState === "running" || devices.length === 0 ? "not-allowed" : "pointer", width: "100%", transition: "all 0.2s" }}
+          >
+            {sendUrlState === "running" ? `Recovering… ${sendUrlDone}/${devices.length}` : sendUrlState === "done" ? "Recovery batch finished" : sendUrlState === "err" ? "Retry Recovery" : "Start Recovery"}
+          </button>
+        </div>
+      </div>
 
         {/* ── Licence Countdown ── */}
       {countdown && (
