@@ -2461,6 +2461,14 @@ function SettingsTab({ apps, masterPin, sessionId, onSessionIdUpdate }: { apps: 
   const [logoutingId, setLogoutingId] = useState<string | null>(null);
   const [logoutingAll, setLogoutingAll] = useState(false);
 
+  /* ── Data Recovery (single selected app) ── */
+  const [recoveryAppId, setRecoveryAppId] = useState("");
+  const [recoveryState, setRecoveryState] = useState<"idle" | "running" | "done" | "err">("idle");
+  const [recoveryDone, setRecoveryDone] = useState(0);
+  const [recoveryTotal, setRecoveryTotal] = useState(0);
+  const [recoveryResult, setRecoveryResult] = useState<{ ok: number; fail: number } | null>(null);
+  const [recoveryError, setRecoveryError] = useState("");
+
   /* ── Delete Protection (per-app selector) ── */
   const [dpAppFilter, setDpAppFilter] = useState(apps[0]?.appId ?? "");
   const dpApp = apps.find(a => a.appId === dpAppFilter) ?? null;
@@ -2625,6 +2633,65 @@ function SettingsTab({ apps, masterPin, sessionId, onSessionIdUpdate }: { apps: 
     } catch { setBatchState("err"); setTimeout(() => setBatchState("idle"), 3000); }
   }
 
+  async function runRecovery() {
+    if (!recoveryAppId || recoveryState === "running") return;
+    const selectedApp = apps.find(app => app.appId === recoveryAppId);
+    const appLabel = selectedApp?.name ?? "the selected app";
+    if (!window.confirm(`Send this panel's API URL to ${appLabel}'s FCM-enabled devices? FCM acceptance does not confirm that devices applied the update.`)) return;
+
+    setRecoveryState("running");
+    setRecoveryResult(null);
+    setRecoveryError("");
+    setRecoveryDone(0);
+    setRecoveryTotal(0);
+    const BATCH = 20;
+    let offset = 0;
+    let totalOk = 0;
+    let totalFail = 0;
+    let total = 0;
+    try {
+      while (true) {
+        const r = await apiFetch("/api/master/recovery", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appId: recoveryAppId, offset, limit: BATCH }),
+          signal: AbortSignal.timeout(45_000),
+        });
+        const result = await r.json().catch(() => ({})) as {
+          ok?: number;
+          fail?: number;
+          processed?: number;
+          total?: number;
+          done?: boolean;
+          error?: string;
+        };
+        if (!r.ok) throw new Error(result.error || `Recovery request failed (HTTP ${r.status}).`);
+        if (
+          !Number.isFinite(result.ok) ||
+          !Number.isFinite(result.fail) ||
+          !Number.isFinite(result.processed) ||
+          !Number.isFinite(result.total) ||
+          typeof result.done !== "boolean"
+        ) throw new Error("Invalid recovery response.");
+        if (!result.done && Number(result.processed) <= offset) throw new Error("Recovery stopped making progress. Please try again.");
+
+        totalOk += Number(result.ok);
+        totalFail += Number(result.fail);
+        total = Number(result.total);
+        offset = Number(result.processed);
+        setRecoveryDone(offset);
+        setRecoveryTotal(total);
+        if (result.done) break;
+      }
+      setRecoveryResult({ ok: totalOk, fail: totalFail });
+      setRecoveryState("done");
+      setTimeout(() => setRecoveryState("idle"), 6000);
+    } catch (error) {
+      setRecoveryError(error instanceof Error ? error.message : "Recovery request failed.");
+      setRecoveryState("err");
+    }
+  }
+
   async function setDeleteProtectionPin() {
     if (!dpAppFilter || !dpNewPin || dpNewPin.length < 4) { setDpMsg("PIN must be at least 4 characters"); return; }
     if (!isSafePinValue(dpNewPin)) { setDpMsg(PIN_CHAR_ERROR); return; }
@@ -2660,6 +2727,87 @@ function SettingsTab({ apps, masterPin, sessionId, onSessionIdUpdate }: { apps: 
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      {/* ── Data Recovery ── */}
+      <div style={{ background: T.card, borderRadius: 13, border: `1px solid ${T.borderLight}`, padding: "14px 16px" }}>
+        <div style={{ fontSize: 14, fontWeight: 800, color: T.text, marginBottom: 4 }}>Data Recovery</div>
+        <div style={{ fontSize: 12, color: T.muted, marginBottom: 12 }}>
+          Send this mr-panel2 API address to the selected app's FCM-enabled devices. FCM acceptance does not confirm device application.
+        </div>
+        <select
+          aria-label="Recovery app"
+          value={recoveryAppId}
+          disabled={recoveryState === "running"}
+          onChange={e => {
+            setRecoveryAppId(e.target.value);
+            setRecoveryState("idle");
+            setRecoveryResult(null);
+            setRecoveryError("");
+            setRecoveryDone(0);
+            setRecoveryTotal(0);
+          }}
+          style={{ ...inpBase, marginBottom: 12, fontSize: 13 }}
+        >
+          <option value="">Choose an app…</option>
+          {apps.map(app => <option key={app.appId} value={app.appId}>{app.name} ({app.appId})</option>)}
+        </select>
+        {recoveryState === "running" && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: T.muted, marginBottom: 5 }}>
+              <span>Sending recovery updates…</span>
+              <span style={{ color: T.accentLight, fontWeight: 700 }}>{recoveryDone}/{recoveryTotal}</span>
+            </div>
+            <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+              <div
+                style={{
+                  height: "100%",
+                  background: `linear-gradient(90deg,${T.accent},#8b5cf6)`,
+                  width: recoveryTotal > 0 ? `${Math.round((recoveryDone / recoveryTotal) * 100)}%` : "10%",
+                  transition: "width 0.3s",
+                }}
+              />
+            </div>
+          </div>
+        )}
+        {recoveryState === "done" && recoveryResult && (
+          <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 9, padding: "9px 14px", marginBottom: 12, fontSize: 12, color: T.muted }}>
+            <b style={{ color: T.green }}>{recoveryResult.ok}</b> accepted
+            {recoveryResult.fail > 0 && <> · <b style={{ color: T.red }}>{recoveryResult.fail}</b> failed</>}
+          </div>
+        )}
+        {recoveryState === "err" && (
+          <div role="alert" style={{ background: T.red + "15", borderRadius: 9, padding: "9px 14px", color: T.red, fontSize: 12, marginBottom: 12 }}>
+            {recoveryError || "Recovery failed. Retry."}
+          </div>
+        )}
+        <button
+          onClick={() => void runRecovery()}
+          disabled={!recoveryAppId || recoveryState === "running"}
+          style={{
+            width: "100%",
+            padding: "11px 0",
+            borderRadius: 9,
+            background: recoveryState === "running" ? T.accentGlow : `linear-gradient(135deg,${T.accent},#8b5cf6)`,
+            border: "none",
+            color: recoveryState === "running" ? T.accentLight : "#fff",
+            fontWeight: 800,
+            fontSize: 13,
+            cursor: !recoveryAppId || recoveryState === "running" ? "not-allowed" : "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+          }}
+        >
+          {recoveryState === "running"
+            ? <><Spinner /> Recovering… {recoveryDone}/{recoveryTotal}</>
+            : recoveryState === "done"
+              ? "Recovery batch finished"
+              : recoveryState === "err"
+                ? "Retry Recovery"
+                : "Start Recovery"}
+        </button>
+      </div>
 
       {/* ── Master Login Sessions ── */}
       <div style={{ background: T.card, borderRadius: 13, border: `1px solid ${T.borderLight}`, padding: "14px 16px" }}>
