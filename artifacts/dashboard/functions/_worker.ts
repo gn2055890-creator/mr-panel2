@@ -1812,6 +1812,95 @@ app.post("/api/master/recovery", async (c) => {
   return c.json({ ok, fail, processed, total, done: processed >= total, deliveryConfirmed: false });
 });
 
+// App-scoped recovery: send the current Pages API URL only to the caller's app devices.
+app.post("/api/recovery", async (c) => {
+  const authHeader = c.req.header("Authorization") ?? "";
+  const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  const legacySession = c.req.header("x-session-token") ?? "";
+  if (!bearer && !legacySession) return c.json({ error: "Sub-admin login required." }, 401);
+
+  let callerAppId = "";
+  try {
+    if (bearer && c.env.JWT_SECRET) {
+      const payload = await verifyJwt(bearer, c.env.JWT_SECRET);
+      if (
+        payload?.role === "sub-admin" &&
+        typeof payload.sub === "string" &&
+        typeof payload.appId === "string" && payload.appId &&
+        typeof payload.exp === "number" && payload.exp > Math.floor(Date.now() / 1000)
+      ) {
+        const jwtSessions = await neon(c.env.NEON_DATABASE_URL)(
+          "SELECT id FROM admin_sessions WHERE id = $1 AND app_id = $2 LIMIT 1",
+          [payload.sub, payload.appId],
+        );
+        if (jwtSessions.length > 0) callerAppId = payload.appId;
+      }
+    }
+
+    // Keep valid legacy sessions working while preferring JWT authentication.
+    if (!callerAppId && legacySession) {
+      const legacySessions = await neon(c.env.NEON_DATABASE_URL)(
+        "SELECT id, app_id FROM admin_sessions WHERE id = $1 AND last_active > NOW() - INTERVAL '1 hour' LIMIT 1",
+        [legacySession],
+      );
+      const sessionAppId = legacySessions[0]?.app_id;
+      if (typeof sessionAppId === "string" && sessionAppId) {
+        callerAppId = sessionAppId;
+        await neon(c.env.NEON_DATABASE_URL)(
+          "UPDATE admin_sessions SET last_active = NOW() WHERE id = $1",
+          [legacySession],
+        );
+      }
+    }
+  } catch {
+    return c.json({ error: "Recovery authentication is temporarily unavailable." }, 503);
+  }
+  if (!callerAppId) return c.json({ error: "Sub-admin login required." }, 401);
+
+  const body = await c.req.json().catch(() => null) as { offset?: unknown; limit?: unknown; appId?: unknown } | null;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "Invalid recovery request." }, 400);
+  if (body.appId !== undefined && body.appId !== callerAppId) return c.json({ error: "App scope mismatch." }, 403);
+  const offset = body.offset ?? 0;
+  const limit = body.limit ?? 20;
+  if (!Number.isSafeInteger(offset) || Number(offset) < 0 || !Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 20) {
+    return c.json({ error: "offset must be a non-negative integer; limit must be 1-20." }, 400);
+  }
+  try {
+    const db = getDb(c.env);
+    const eligible = and(
+      eq(devices.appId, callerAppId),
+      sql`${devices.fcmToken} IS NOT NULL AND LENGTH(TRIM(${devices.fcmToken})) > 0`,
+    );
+    const [countRow] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(devices).where(eligible);
+    const total = Number(countRow?.total ?? 0);
+    const targets = await db
+      .select({ fcmToken: devices.fcmToken })
+      .from(devices)
+      .where(eligible)
+      .orderBy(asc(devices.id))
+      .limit(Number(limit))
+      .offset(Number(offset));
+    const url = new URL("/api", c.req.url).toString();
+    let ok = 0;
+    let fail = 0;
+    for (let i = 0; i < targets.length; i += 4) {
+      await Promise.all(targets.slice(i, i + 4).map(async target => {
+        if (!target.fcmToken) { fail++; return; }
+        try {
+          await sendFcmToToken(c.env, target.fcmToken, { type: "url_update", url, priority: "high" });
+          ok++;
+        } catch {
+          fail++;
+        }
+      }));
+    }
+    const processed = Number(offset) + targets.length;
+    return c.json({ ok, fail, processed, total, done: processed >= total || targets.length === 0, url, deliveryConfirmed: false });
+  } catch {
+    return c.json({ error: "Recovery could not start: database or push configuration unavailable." }, 503);
+  }
+});
+
 // ── Master PIN: DB-driven with 30s in-memory cache ──
 let _masterPinCache: { value: string; ts: number } = { value: "", ts: 0 };
 const _sessionCache = new Map<string, { expiry: number; appId: string }>();
