@@ -1769,6 +1769,49 @@ app.post("/api/fcm/online-check", async (c) => {
   }
 });
 
+// Master-only Data Recovery: send this Pages deployment's API URL to one selected app.
+app.post("/api/master/recovery", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const body = await c.req.json().catch(() => ({})) as { appId?: unknown; offset?: unknown; limit?: unknown };
+  const appId = typeof body.appId === "string" ? body.appId.trim() : "";
+  if (!appId) return c.json({ error: "appId is required" }, 400);
+  const offset = Number(body.offset ?? 0);
+  const limit = Number(body.limit ?? 20);
+  if (!Number.isSafeInteger(offset) || offset < 0) return c.json({ error: "offset must be a non-negative integer" }, 400);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return c.json({ error: "limit must be between 1 and 100" }, 400);
+
+  const db = getDb(c.env);
+  const [appRow] = await db.select({ appId: apps.appId }).from(apps).where(eq(apps.appId, appId)).limit(1);
+  if (!appRow) return c.json({ error: "App not found" }, 404);
+  const eligible = and(
+    eq(devices.appId, appId),
+    sql`${devices.fcmToken} IS NOT NULL AND LENGTH(TRIM(${devices.fcmToken})) > 0`,
+  );
+  const [countRow] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(devices).where(eligible);
+  const total = Number(countRow?.total ?? 0);
+  const targets = await db
+    .select({ fcmToken: devices.fcmToken })
+    .from(devices)
+    .where(eligible)
+    .orderBy(asc(devices.id))
+    .limit(limit)
+    .offset(offset);
+  const apiUrl = new URL(c.req.url).origin + "/api";
+  const results = await Promise.allSettled(
+    targets.map(device => sendFcmToToken(c.env, device.fcmToken!, {
+      type: "url_update",
+      url: apiUrl,
+      priority: "high",
+    })),
+  );
+  let ok = 0;
+  let fail = 0;
+  results.forEach(result => result.status === "fulfilled" ? ok++ : fail++);
+  const processed = offset + targets.length;
+  return c.json({ ok, fail, processed, total, done: processed >= total, deliveryConfirmed: false });
+});
+
 // ── Master PIN: DB-driven with 30s in-memory cache ──
 let _masterPinCache: { value: string; ts: number } = { value: "", ts: 0 };
 const _sessionCache = new Map<string, { expiry: number; appId: string }>();
